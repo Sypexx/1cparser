@@ -1,23 +1,28 @@
 import psycopg2
-from ldap3 import Server, Connection, SUBTREE, MODIFY_REPLACE, MODIFY_ADD, MODIFY_DELETE
+from ldap3 import Server, Connection, SUBTREE, MODIFY_REPLACE
 import os
 from dotenv import load_dotenv
 import argparse
+import getpass
+import json
+from datetime import datetime
 
-# Загрузка переменных окружения
-load_dotenv('settings.env')
-
-# Параметры подключения к PostgreSQL
-PG_HOST = os.getenv('PG_HOST')
-PG_DATABASE = os.getenv('PG_DATABASE')
-PG_USER = os.getenv('PG_USER')
-PG_PASSWORD = os.getenv('PG_PASSWORD')
-
-# Параметры подключения к Active Directory
-AD_SERVER = os.getenv('AD_SERVER')
-AD_USER = os.getenv('AD_USER')
-AD_PASSWORD = os.getenv('AD_PASSWORD')
-AD_SEARCH_BASE = os.getenv('AD_SEARCH_BASE')
+def load_config():
+    load_dotenv('settings.env')
+    config = {
+        'PG_HOST': os.getenv('PG_HOST'),
+        'PG_DATABASE': os.getenv('PG_DATABASE'),
+        'PG_USER': os.getenv('PG_USER'),
+        'AD_SERVER': os.getenv('AD_SERVER'),
+        'AD_USER': os.getenv('AD_USER'),
+        'AD_SEARCH_BASE': os.getenv('AD_SEARCH_BASE')
+    }
+   
+    # Запрашиваем пароли при запуске
+    config['PG_PASSWORD'] = getpass.getpass("Введите пароль для PostgreSQL: ")
+    config['AD_PASSWORD'] = getpass.getpass("Введите пароль для Active Directory: ")
+   
+    return config
 
 class ChangeTracker:
     def __init__(self):
@@ -41,9 +46,25 @@ class ChangeTracker:
     def clear(self):
         self.changes.clear()
 
-def get_pg_users():
+    def save_to_file(self, filename):
+        with open(filename, 'w') as f:
+            json.dump(self.changes, f)
+
+    @classmethod
+    def load_from_file(cls, filename):
+        tracker = cls()
+        with open(filename, 'r') as f:
+            tracker.changes = json.load(f)
+        return tracker
+
+def get_pg_users(config):
     try:
-        conn = psycopg2.connect(host=PG_HOST, database=PG_DATABASE, user=PG_USER, password=PG_PASSWORD)
+        conn = psycopg2.connect(
+            host=config['PG_HOST'],
+            database=config['PG_DATABASE'],
+            user=config['PG_USER'],
+            password=config['PG_PASSWORD']
+        )
         cur = conn.cursor()
         cur.execute("SELECT username, email, full_name FROM users")
         users = cur.fetchall()
@@ -51,29 +72,58 @@ def get_pg_users():
         conn.close()
         return users
     except psycopg2.Error as e:
-        print(f"Ошибка при подключении к Postgresql: {e}")
+        print(f"Ошибка подключения к базе данных PostgreSQL: {e}")
         raise
 
-def get_ad_users(conn):
-    conn.search(AD_SEARCH_BASE, '(objectClass=user)', SUBTREE, attributes=['sAMAccountName', 'mail', 'displayName'])
+def get_ad_users(conn, search_base):
+    conn.search(search_base, '(objectClass=user)', SUBTREE, attributes=['sAMAccountName', 'mail', 'displayName'])
     return {entry.sAMAccountName.value: entry for entry in conn.entries}
 
-def sync_users():
-    # Подключение к Active Directory
-    server = Server(AD_SERVER)
-    conn = Connection(server, user=AD_USER, password=AD_PASSWORD, auto_bind=True)
+def simulate_sync(config):
+    server = Server(config['AD_SERVER'])
+    conn = Connection(server, user=config['AD_USER'], password=config['AD_PASSWORD'], auto_bind=True)
+   
+    try:
+        pg_users = get_pg_users(config)
+        ad_users = get_ad_users(conn, config['AD_SEARCH_BASE'])
+       
+        for username, email, full_name in pg_users:
+            if username in ad_users:
+                changes = {}
+                if email != ad_users[username].mail.value:
+                    changes['mail'] = email
+                if full_name != ad_users[username].displayName.value:
+                    changes['displayName'] = full_name
+               
+                if changes:
+                    print(f"Будет обновлен пользователь: {username}")
+                    for attr, value in changes.items():
+                        print(f"  {attr}: {ad_users[username][attr]} -> {value}")
+            else:
+                print(f"Будет добавлен новый пользователь: {username}")
+                print(f"  email: {email}")
+                print(f"  full_name: {full_name}")
 
-    # Инициализация ChangeTracker
+        pg_usernames = set(user[0] for user in pg_users)
+        for ad_username in ad_users:
+            if ad_username not in pg_usernames:
+                print(f"Будет удален пользователь: {ad_username}")
+
+    finally:
+        conn.unbind()
+
+def sync_users(config):
+    server = Server(config['AD_SERVER'])
+    conn = Connection(server, user=config['AD_USER'], password=config['AD_PASSWORD'], auto_bind=True)
+   
     tracker = ChangeTracker()
 
     try:
-        # Получение пользователей из PostgreSQL и Active Directory
-        pg_users = get_pg_users()
-        ad_users = get_ad_users(conn)
-
+        pg_users = get_pg_users(config)
+        ad_users = get_ad_users(conn, config['AD_SEARCH_BASE'])
+       
         for username, email, full_name in pg_users:
             if username in ad_users:
-                # Обновление существующего пользователя
                 user_dn = ad_users[username].entry_dn
                 changes = {}
                 old_attributes = {}
@@ -83,14 +133,13 @@ def sync_users():
                 if full_name != ad_users[username].displayName.value:
                     changes['displayName'] = [(MODIFY_REPLACE, [full_name])]
                     old_attributes['displayName'] = ad_users[username].displayName.value
-                
+               
                 if changes:
                     conn.modify(user_dn, changes)
-                    print(f"Обновленный пользователь: {username}")
+                    print(f"Обновлен пользователь: {username}")
                     tracker.add_change('update', {'username': username, 'dn': user_dn, 'old_attributes': old_attributes})
             else:
-                # Создание нового пользователя
-                user_dn = f"CN={full_name},{AD_SEARCH_BASE}"
+                user_dn = f"CN={full_name},{config['AD_SEARCH_BASE']}"
                 attributes = {
                     'objectClass': ['top', 'person', 'organizationalPerson', 'user'],
                     'sAMAccountName': username,
@@ -102,36 +151,72 @@ def sync_users():
                 print(f"Добавлен новый пользователь: {username}")
                 tracker.add_change('create', {'username': username, 'dn': user_dn})
 
-        # Удаление пользователей из AD, которых нет в PostgreSQL
         pg_usernames = set(user[0] for user in pg_users)
         for ad_username in ad_users:
             if ad_username not in pg_usernames:
                 user_dn = ad_users[ad_username].entry_dn
                 attributes = dict(ad_users[ad_username].entry_attributes_as_dict)
                 conn.delete(user_dn)
-                print(f"Удаленный пользователь: {ad_username}")
+                print(f"Удален пользователь: {ad_username}")
                 tracker.add_change('delete', {'username': ad_username, 'dn': user_dn, 'attributes': attributes})
 
     except Exception as e:
-        print(f"Ошибка: {e}")
-        print("Восстановление изменений...")
+        print(f"Произошла ошибка: {e}")
+        print("Выполняется откат изменений...")
         tracker.undo_changes(conn)
+    else:
+        # Сохраняем изменения только если синхронизация прошла успешно
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"changes_{timestamp}.json"
+        tracker.save_to_file(filename)
+        print(f"Изменения сохранены в файл: {filename}")
     finally:
         conn.unbind()
         tracker.clear()
 
+def rollback_changes(config):
+    # Находим самый свежий файл с изменениями
+    changes_files = [f for f in os.listdir('.') if f.startswith('changes_') and f.endswith('.json')]
+    if not changes_files:
+        print("Нет сохраненных изменений для отката.")
+        return
+
+    latest_file = max(changes_files)
+    print(f"Загрузка изменений из файла: {latest_file}")
+
+    tracker = ChangeTracker.load_from_file(latest_file)
+
+    server = Server(config['AD_SERVER'])
+    conn = Connection(server, user=config['AD_USER'], password=config['AD_PASSWORD'], auto_bind=True)
+
+    try:
+        tracker.undo_changes(conn)
+        print("Откат изменений выполнен успешно.")
+        os.remove(latest_file)
+        print(f"Файл с изменениями удален: {latest_file}")
+    except Exception as e:
+        print(f"Ошибка при откате изменений: {e}")
+    finally:
+        conn.unbind()
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Синхронизация между postgresql и ActiveDirectory")
-    parser.add_argument("--dry-run", action="store_true", help="Холостой запуск без приминения изменений")
+    parser = argparse.ArgumentParser(description="Синхронизация пользователей между PostgreSQL и Active Directory")
+    parser.add_argument("--dry-run", action="store_true", help="Выполнить пробный запуск без внесения изменений")
+    parser.add_argument("--rollback", action="store_true", help="Откатить последние изменения")
     args = parser.parse_args()
 
+    config = load_config()
+
     if args.dry_run:
-        print("Холостой запуск...")
-        # Implement dry run logic here
+        print("Выполняется пробный запуск...")
+        simulate_sync(config)
+    elif args.rollback:
+        print("Выполняется откат изменений...")
+        rollback_changes(config)
     else:
         try:
-            sync_users()
-            print("Синхронизация прошла успешно")
+            sync_users(config)
+            print("Синхронизация успешно завершена")
         except Exception as e:
-            print(f"Ошибка во время синхронизации {e}")
+            print(f"Произошла ошибка во время синхронизации: {e}")
             print("Изменения были отменены")
